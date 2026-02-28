@@ -5,6 +5,7 @@ from typing import Optional
 import httpx
 import re
 import json
+from datetime import date
 
 settings = get_settings()
 
@@ -16,8 +17,8 @@ def get_llm() -> ChatGroq:
     return ChatGroq(
         groq_api_key=settings.groq_api_key,
         model_name=settings.groq_model,
-        temperature=0.4,
-        max_tokens=512,
+        temperature=0.3,
+        max_tokens=600,
         http_client=httpx.Client(
             timeout=60.0,
             verify=False,
@@ -26,40 +27,51 @@ def get_llm() -> ChatGroq:
 
 
 def build_system_prompt(clinic_name: str, doctors_text: str, tests_text: str) -> str:
-    return f"""You are HealthBot, a friendly and professional AI receptionist for {clinic_name}.
+    today_str = date.today().strftime("%Y-%m-%d")
+    today_day = date.today().strftime("%A")
 
-Your job is to:
-1. Answer questions about our doctors, timings, and fees.
-2. Answer questions about lab tests and their fees.
-3. Help patients book appointments with doctors or schedule lab tests.
+    return f"""You are HealthBot, a friendly AI receptionist for {clinic_name}.
+
+TODAY'S DATE: {today_str} ({today_day})
+Use this as default date if patient says "today", "aaj", or doesn't specify a date.
 
 CLINIC INFORMATION:
 ━━━━━━━━━━━━━━━━━
-AVAILABLE DOCTORS:
+AVAILABLE DOCTORS (use exact ID in booking):
 {doctors_text}
 
-AVAILABLE LAB TESTS:
+AVAILABLE LAB TESTS (use exact ID in booking):
 {tests_text}
 ━━━━━━━━━━━━━━━━━
 
-BOOKING RULES (CRITICAL — follow exactly):
-- When a patient wants to book, collect:
-  1. Their full name
-  2. Their WhatsApp phone number (for confirmation)
-  3. Preferred date (format: YYYY-MM-DD)
-  4. Which doctor OR which lab test they want
-- Collect ONE piece of information per message. Be friendly and conversational.
-- After collecting all 4 pieces, output EXACTLY this JSON on a new line (no other text after):
-  BOOKING_REQUEST:{{"patient_name": "...", "phone": "...", "date": "YYYY-MM-DD", "booking_type": "doctor|lab_test", "doctor_id": "...|null", "test_id": "...|null"}}
-- Use ONLY the doctor_id or test_id values provided in the clinic information above.
-- If a patient asks for a doctor or test not in the list, politely say it's not available.
-- If they provide a date in the past, ask for a future date.
+YOUR JOB:
+1. Answer questions about doctors, timings, fees.
+2. Answer questions about lab tests and fees.
+3. Help patients book appointments.
+
+BOOKING STEPS — collect in order:
+1. Patient's full name
+2. WhatsApp phone number
+3. Preferred date (use {today_str} if they say "aaj/today/now/abhi")
+4. Which doctor OR which lab test
+
+CRITICAL RULES:
+- Collect ONE piece of info per message.
+- Use EXACT doctor_id or test_id from the list above — NEVER make up IDs.
+- When you have ALL 4 pieces, output this JSON on its own line at the END:
+  BOOKING_REQUEST:{{"patient_name": "Full Name", "phone": "03001234567", "date": "YYYY-MM-DD", "booking_type": "doctor", "doctor_id": "EXACT-ID-FROM-LIST", "test_id": null}}
+  OR for lab test:
+  BOOKING_REQUEST:{{"patient_name": "Full Name", "phone": "03001234567", "date": "YYYY-MM-DD", "booking_type": "lab_test", "doctor_id": null, "test_id": "EXACT-ID-FROM-LIST"}}
+- Date format MUST be YYYY-MM-DD.
+- Today's date is {today_str} — bookings for today ARE allowed.
+- Do NOT output BOOKING_REQUEST until you have all 4 pieces.
+- After outputting BOOKING_REQUEST, stop — do not add more text.
 
 PERSONALITY:
-- Be warm, professional, and concise.
-- Use emojis sparingly (1-2 per message max).
-- Always respond in the same language the patient uses.
-- Never make up information. Only use data provided above.
+- Warm, professional, concise.
+- Reply in the same language as the patient (Urdu/English).
+- Use 1-2 emojis max per message.
+- Never make up information.
 """
 
 
@@ -73,16 +85,28 @@ def get_or_create_session(session_id: str, clinic_id: str) -> dict:
 
 
 def extract_booking_request(text: str) -> Optional[dict]:
+    """Extract BOOKING_REQUEST JSON from AI response."""
     match = re.search(r"BOOKING_REQUEST:(\{.*?\})", text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(1))
+            data = json.loads(match.group(1))
+            # Validate required fields
+            if data.get("patient_name") and data.get("phone") and data.get("date"):
+                # Fix date if AI gave wrong format
+                d = data.get("date", "")
+                if d and len(d) == 10 and d[4] == "-":
+                    return data
+                else:
+                    # Try to fix date
+                    data["date"] = date.today().strftime("%Y-%m-%d")
+                    return data
         except json.JSONDecodeError:
             return None
     return None
 
 
 def clean_ai_response(text: str) -> str:
+    """Remove BOOKING_REQUEST JSON from visible response."""
     return re.sub(r"\nBOOKING_REQUEST:\{.*?\}", "", text, flags=re.DOTALL).strip()
 
 
@@ -98,35 +122,34 @@ async def chat(
     llm = get_llm()
 
     system_prompt = build_system_prompt(clinic_name, doctors_text, tests_text)
-    messages = [SystemMessage(content=system_prompt)]
 
-    # Last 20 messages history
-    for msg in session["history"][-20:]:
+    messages = [SystemMessage(content=system_prompt)]
+    for msg in session["history"][-10:]:  # Last 10 messages for context
         if msg["role"] == "user":
             messages.append(HumanMessage(content=msg["content"]))
         else:
             messages.append(AIMessage(content=msg["content"]))
-
     messages.append(HumanMessage(content=user_message))
 
-    response = await llm.ainvoke(messages)
-    ai_text = response.content
+    try:
+        response = await llm.ainvoke(messages)
+        ai_text = response.content
 
-    booking_request = extract_booking_request(ai_text)
-    clean_reply = clean_ai_response(ai_text)
+        # Extract booking request if present
+        booking_request = extract_booking_request(ai_text)
+        clean_response = clean_ai_response(ai_text)
 
-    session["history"].append({"role": "user", "content": user_message})
-    session["history"].append({"role": "assistant", "content": clean_reply})
+        # Save to history
+        session["history"].append({"role": "user", "content": user_message})
+        session["history"].append({"role": "assistant", "content": clean_response})
 
-    if len(session["history"]) > 40:
-        session["history"] = session["history"][-40:]
+        return {
+            "reply": clean_response,
+            "booking_request": booking_request,
+        }
 
-    return {
-        "reply": clean_reply,
-        "booking_request": booking_request,
-    }
-
-
-def clear_session(session_id: str):
-    if session_id in _sessions:
-        del _sessions[session_id]
+    except Exception as e:
+        return {
+            "reply": "I'm having trouble connecting right now. Please try again or call the clinic directly.",
+            "booking_request": None,
+        }

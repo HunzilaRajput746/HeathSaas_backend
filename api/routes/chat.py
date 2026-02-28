@@ -84,7 +84,14 @@ async def chat_endpoint(
                 fee = test["fee"]
                 test_name = test["name"]
 
-        # Assign slot
+        # Pass doctor for timing-aware slot assignment
+        doctor_for_slot = None
+        if br.get("booking_type") == "doctor" and br.get("doctor_id"):
+            doctor_for_slot = await clinic_service.get_doctor_by_id(
+                db, clinic_id, br["doctor_id"]
+            )
+
+        # Assign slot — today allowed, doctor timings respected
         time_slot, actual_date = await booking_service.assign_next_available_slot(
             db=db,
             clinic_id=clinic_id,
@@ -93,6 +100,7 @@ async def chat_endpoint(
             slot_minutes=settings_data.get("slot_duration_minutes", 10),
             working_start=settings_data.get("working_hours_start", "09:00"),
             working_end=settings_data.get("working_hours_end", "17:00"),
+            doctor=doctor_for_slot,
         )
 
         if not time_slot:
