@@ -16,14 +16,11 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    # Startup
     await connect_db()
     db = get_db()
     await create_indexes(db)
     print("🚀 HealthSaaS API is ready!")
     yield
-    # Shutdown
     await close_db()
     print("👋 HealthSaaS API shutdown complete")
 
@@ -35,15 +32,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ─── CORS ─────────────────────────────────────────────────────────────────────
+# ─── CORS — Allow ALL origins ─────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.frontend_url,
-        "http://localhost:3000",
-        "https://*.vercel.app",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -61,7 +54,6 @@ async def root():
         "status": "healthy",
         "service": "HealthSaaS API",
         "version": "1.0.0",
-        "docs": "/docs",
     }
 
 
@@ -70,13 +62,12 @@ async def health_check():
     return {"status": "ok"}
 
 
-# ─── DEV RUNNER ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=settings.environment == "development",
+        reload=True,
         log_level="info",
     )
